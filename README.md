@@ -1,6 +1,6 @@
 # caus
 
-Prototype sandbox for a mobile online indie game with event sourcing.
+Prototype sandbox for a 4x game built on an event-sourced backend.
 
 - [Prototype spec](docs/prototype-spec.md)
 - [Design checkpoint (second iteration)](docs/design-checkpoint-second-iteration.md)
