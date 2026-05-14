@@ -2,6 +2,10 @@
 
 Prototype sandbox for a mobile online indie game with event sourcing.
 
+- [Prototype spec](docs/prototype-spec.md)
+- [Design checkpoint (second iteration)](docs/design-checkpoint-second-iteration.md)
+- [Design checkpoint (first iteration)](docs/design-checkpoint-first-iteration.md)
+
 ## Setup
 
 ```bash
