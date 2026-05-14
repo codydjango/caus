@@ -208,9 +208,75 @@ This keeps replay cost proportional to `(window_size + snapshot_interval)` rathe
 - Active projection per player resolves to a specific branch
 - Collapse appends `BranchCollapsed`, marks discarded branch's events as historical-only
 
-### Wall clock vs world clock
+### World clock implementation
 
-Rollback operates on **world_clock_at**. The world clock advances only while the simulation runs (pauses, maintenance, async-turn waits don't count). Force Forward restores events to their original world-clock positions; the simulation resumes from there. This prevents exploits like "rollback through an opponent's lunch break."
+**Design constraint: the game is always on. There is no pause.** No maintenance windows that stop the world, no per-match pause, no async-turn waits that freeze the clock. This simplifies the model considerably — world clock is just monotonic time since world creation.
+
+**Implementation:**
+
+```
+world_clock_state:
+  epoch_start_monotonic_ns   (bigint, captured once at world creation)
+
+WorldClock.now():
+  return (time.monotonic_ns() - epoch_start_monotonic_ns) / 1_000_000_000
+```
+
+Use the OS monotonic clock (`time.monotonic_ns()` / `CLOCK_MONOTONIC`), not wall clock — wall clock can jump backward from NTP corrections, which would break the monotonicity that rollback queries depend on.
+
+**Two layers of time, one source:**
+
+- **Continuous world_clock** (decimal seconds) — stamped on every event at write time, used for ordering and rollback window queries. Stored as `numeric(20, 6)` for microsecond precision.
+- **Integer tick number** (bigint, whole game-seconds) — discrete tick events (`WorldTickAdvanced`) emitted by a background loop when integer boundaries are crossed. Used to drive scheduled effects (building completion, crop growth, resource accumulation, decay).
+
+The tick loop is idempotent: it reads `WorldClock.now()`, emits `WorldTickAdvanced` for any integer seconds crossed since `last_emitted_tick`, advances the marker. Restarting the worker can't double-emit.
+
+**Replay:** stored `world_clock_at` values are authoritative. Replay reads them; never recomputes from wall clock. This means the only place wall-clock-to-world-clock conversion happens is when *new* events are written. Historical events have their world_clock baked in.
+
+**Scope freezing during reaction windows** happens at the command-validation layer, not the world clock. `WorldClock.now()` keeps advancing globally; commands targeting frozen scopes are rejected or queued until the window closes.
+
+**Consequences of "always on":**
+
+- Scheduled effects fire whether players are present or not (crops grow, buildings complete during offline hours). Standard persistent-world behavior.
+- Reaction windows can hit offline players, who'll miss them. This is a gameplay concern (see open threads) not an architecture concern.
+- Multi-region deployments need a single source of truth for `epoch_start_monotonic_ns` and ideally for `WorldClock.now()` reads. Single-region: trivial. Multi-region: route world_clock through a primary, or accept small skew on distant writers.
+
+Rollback still operates on `world_clock_at` (now equivalent to "monotonic time since world creation"). Force Forward restores events to their original world_clock positions and play continues from there.
+
+
+---
+
+## Presentation decoupling
+
+### Principle
+
+The backend produces **atomic, authoritative state transitions**. The client **narrates** them. Animation pacing, easing curves, dramatic timing — all client-side. The backend doesn't know or care that a rollback takes 4 seconds to animate; from its perspective the state transition is instantaneous and the rollback either happened or it didn't.
+
+Why this matters:
+
+- Backend stays simple — no "partially applied" rollback states, no animation-aware logic, no client-pacing concerns
+- Different clients render differently — spectator views, player views, replay viewers, mobile vs. desktop, headless test clients all consume the same authoritative state
+- Animation never affects correctness — a client crash mid-animation reconnects and lands cleanly in the post-state
+
+### What the backend owes the client for a temporal event
+
+For a rollback, the client receives (in a single push):
+
+1. **The post-rollback state** — the authoritative new projection (the destination of the scrub)
+2. **The voided event list** — events being unmade, with their `world_clock_at` timestamps, so the client can animate individual unmaking moments
+3. **The `RollbackApplied` summary event** — including metadata like rollback tier (tactical / strategic / catastrophic) so the client can pick an appropriate animation duration
+
+The client owns all pacing. A 3-minute rollback of 200 events takes ~4 seconds of animation, not 3 minutes. A 10-second rollback of 5 events takes ~2 seconds, not 200ms. Duration is a function of *dramatic weight*, not event count or window size.
+
+The reverse holds for `ForceForwardApplied` — same shape, opposite direction. Voided actions in the after-window can be briefly visualized appearing-then-dissolving so players see exactly what collateral was lost.
+
+### What freezes visually
+
+During a rollback animation, the rest of the world holds still visually. This aligns with backend reality during the reaction window (where the affected scope is genuinely frozen), and keeps the visualization legible. The world clock keeps advancing on the backend, but nothing the user needs to see is happening in those 4 seconds.
+
+### What's deferred
+
+Animation curves, exact durations per tier, specific visual effects, audio design, UI affordances for the timeline scrub — all client-side, all out of scope here. The architectural contract is the three-item push above.
 
 ---
 
@@ -347,3 +413,5 @@ Things to dig into when this picks up again:
 11. **Aggregate-local event streams vs. global ledger** — do aggregates have their own event streams that project up to the world ledger, or do they share one ledger with filtered views? Affects partitioning and replay strategy.
 12. **Compensation timeouts** — if a process manager's compensation step fails (e.g., can't release materials because Player aggregate is locked), what's the escalation path?
 13. **Optimistic concurrency for resource debits** — version numbers on Player aggregate? Conditional events? How does the system detect concurrent spending of the same Chronite?
+14. **Offline reaction windows** — game is always on; reaction windows can hit players who are asleep / logged off. Options to consider: longer windows for offline targets, push notifications, pre-set "auto-Seal" preferences, or accept that being offline is competitive risk. Game design problem, not architecture.
+15. **Multi-region world clock** — if deployed multi-region, where does `WorldClock.now()` actually run, and how is skew handled across writers in different regions?
